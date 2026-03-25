@@ -1,0 +1,375 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  Deploy a single-user Windows gaming desktop on Amazon EC2 with a g4dn.xlarge GPU instance,
+  a 100 GiB gp3 root volume, and Amazon DCV for low-latency remote access.
+
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      - Label:
+          default: Networking
+        Parameters:
+          - VpcId
+          - SubnetId
+          - AllowedClientCidr
+          - AssociateElasticIp
+          - EnableRdp
+      - Label:
+          default: Desktop Settings
+        Parameters:
+          - InstanceName
+          - WindowsAmiParameter
+          - AdministratorPassword
+          - DcvServerMsiUrl
+      - Label:
+          default: Compute and Storage
+        Parameters:
+          - InstanceType
+          - RootVolumeSizeGiB
+    ParameterLabels:
+      VpcId:
+        default: VPC
+      SubnetId:
+        default: Subnet
+      AllowedClientCidr:
+        default: Allowed Client CIDR
+      AssociateElasticIp:
+        default: Allocate Elastic IP
+      EnableRdp:
+        default: Open RDP Port
+      InstanceName:
+        default: Instance Name
+      WindowsAmiParameter:
+        default: Windows AMI SSM Parameter
+      AdministratorPassword:
+        default: Administrator Password
+      DcvServerMsiUrl:
+        default: Amazon DCV Server MSI URL
+      InstanceType:
+        default: EC2 Instance Type
+      RootVolumeSizeGiB:
+        default: Root Volume Size (GiB)
+
+Parameters:
+  VpcId:
+    Type: AWS::EC2::VPC::Id
+    Description: VPC where the gaming desktop will be deployed.
+
+  SubnetId:
+    Type: AWS::EC2::Subnet::Id
+    Description: Public subnet with a route to an internet gateway for direct remote access.
+
+  AllowedClientCidr:
+    Type: String
+    Default: 0.0.0.0/0
+    AllowedPattern: '^([0-9]{1,3}\.){3}[0-9]{1,3}/([0-9]|[1-2][0-9]|3[0-2])$'
+    ConstraintDescription: Must be a valid IPv4 CIDR range such as 203.0.113.10/32.
+    Description: IPv4 CIDR allowed to reach Amazon DCV and optional RDP. Restrict this to your IP if possible.
+
+  AssociateElasticIp:
+    Type: String
+    AllowedValues:
+      - 'true'
+      - 'false'
+    Default: 'true'
+    Description: Allocate and associate a stable public IPv4 address to the instance.
+
+  EnableRdp:
+    Type: String
+    AllowedValues:
+      - 'true'
+      - 'false'
+    Default: 'false'
+    Description: Open inbound TCP/3389 in the security group. Leave disabled unless you need RDP.
+
+  InstanceName:
+    Type: String
+    Default: GamingDesktop
+    MinLength: 1
+    MaxLength: 64
+    AllowedPattern: '^[A-Za-z0-9][A-Za-z0-9._ -]*$'
+    Description: Name tag applied to the EC2 instance.
+
+  WindowsAmiParameter:
+    Type: AWS::SSM::Parameter::Value<AWS::EC2::Image::Id>
+    Default: /aws/service/ami-windows-latest/Windows_Server-2022-English-Full-Base
+    Description: SSM parameter that resolves to the Windows AMI to launch.
+
+  AdministratorPassword:
+    Type: String
+    NoEcho: true
+    MinLength: 12
+    MaxLength: 64
+    AllowedPattern: '^(?=.{12,64}$)(?=.*[a-z])(?=.*[A-Z])(?=.*\d)(?=.*[!@#%^*_\-+=:,.?])[A-Za-z\d!@#%^*_\-+=:,.?]+$'
+    ConstraintDescription: Must be 12-64 characters with upper, lower, number, and one of ! @ # % ^ * _ - + = : , . ?
+    Description: Initial password set on the built-in Administrator account.
+
+  DcvServerMsiUrl:
+    Type: String
+    Default: https://d1uj6qtbmh3dt5.cloudfront.net/2025.0/Servers/nice-dcv-server-x64-Release-2025.0-20103.msi
+    Description: Amazon DCV server installer URL.
+
+  InstanceType:
+    Type: String
+    Default: g4dn.xlarge
+    AllowedValues:
+      - g4dn.xlarge
+    Description: GPU instance type for the desktop.
+
+  RootVolumeSizeGiB:
+    Type: Number
+    Default: 100
+    MinValue: 100
+    MaxValue: 16384
+    Description: Size of the encrypted gp3 root volume in GiB.
+
+Conditions:
+  UseElasticIp: !Equals [!Ref AssociateElasticIp, 'true']
+  OpenRdpPort: !Equals [!Ref EnableRdp, 'true']
+
+Resources:
+  GamingSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Security group for the Windows gaming desktop
+      VpcId: !Ref VpcId
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 8443
+          ToPort: 8443
+          CidrIp: !Ref AllowedClientCidr
+          Description: Amazon DCV HTTPS and WebSocket access
+        - IpProtocol: udp
+          FromPort: 8443
+          ToPort: 8443
+          CidrIp: !Ref AllowedClientCidr
+          Description: Amazon DCV QUIC transport
+      SecurityGroupEgress:
+        - IpProtocol: -1
+          CidrIp: 0.0.0.0/0
+          Description: Allow outbound internet access for updates and game installs
+      Tags:
+        - Key: Name
+          Value: !Sub '${InstanceName}-sg'
+
+  GamingRdpIngress:
+    Type: AWS::EC2::SecurityGroupIngress
+    Condition: OpenRdpPort
+    Properties:
+      GroupId: !Ref GamingSecurityGroup
+      IpProtocol: tcp
+      FromPort: 3389
+      ToPort: 3389
+      CidrIp: !Ref AllowedClientCidr
+      Description: Remote Desktop Protocol
+
+  GamingInstanceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - ec2.amazonaws.com
+            Action:
+              - sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore
+      Policies:
+        - PolicyName: ReadNvidiaGamingDriverBucket
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Sid: ListDriverBucket
+                Effect: Allow
+                Action:
+                  - s3:ListBucket
+                Resource:
+                  - arn:aws:s3:::nvidia-gaming
+              - Sid: ReadDriverObjects
+                Effect: Allow
+                Action:
+                  - s3:GetObject
+                Resource:
+                  - arn:aws:s3:::nvidia-gaming/*
+      Tags:
+        - Key: Name
+          Value: !Sub '${InstanceName}-role'
+
+  GamingInstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      Roles:
+        - !Ref GamingInstanceRole
+
+  GamingInstance:
+    Type: AWS::EC2::Instance
+    CreationPolicy:
+      ResourceSignal:
+        Timeout: PT30M
+    Properties:
+      IamInstanceProfile: !Ref GamingInstanceProfile
+      ImageId: !Ref WindowsAmiParameter
+      InstanceType: !Ref InstanceType
+      InstanceInitiatedShutdownBehavior: stop
+      MetadataOptions:
+        HttpEndpoint: enabled
+        HttpTokens: required
+      SecurityGroupIds:
+        - !Ref GamingSecurityGroup
+      SubnetId: !Ref SubnetId
+      BlockDeviceMappings:
+        - DeviceName: /dev/sda1
+          Ebs:
+            DeleteOnTermination: true
+            Encrypted: true
+            VolumeSize: !Ref RootVolumeSizeGiB
+            VolumeType: gp3
+      Tags:
+        - Key: Name
+          Value: !Ref InstanceName
+        - Key: Workload
+          Value: gaming-desktop
+      UserData:
+        Fn::Base64: !Sub |
+          <powershell>
+          $ErrorActionPreference = "Stop"
+          New-Item -Path "C:\cfn\log" -ItemType Directory -Force | Out-Null
+          New-Item -Path "C:\Installers" -ItemType Directory -Force | Out-Null
+          New-Item -Path "C:\Scripts" -ItemType Directory -Force | Out-Null
+
+          try {
+            Start-Transcript -Path "C:\cfn\log\user-data.log" -Append
+            net user Administrator '${AdministratorPassword}'
+
+            [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
+            Invoke-WebRequest -Uri "${DcvServerMsiUrl}" -OutFile "C:\Installers\amazon-dcv-server.msi"
+
+            $dcvArgs = @(
+              '/i',
+              'C:\Installers\amazon-dcv-server.msi',
+              'ADDLOCAL=audioMicDriver,audioSpkDriver,gamepadDriver,webClient,webrtc,iddDriver',
+              'AUTOMATIC_SESSION_OWNER=Administrator',
+              '/quiet',
+              '/norestart',
+              '/l*v',
+              'C:\cfn\log\dcv-install.log'
+            )
+            Start-Process -FilePath 'msiexec.exe' -ArgumentList $dcvArgs -Wait -NoNewWindow
+
+            New-NetFirewallRule -DisplayName 'Amazon DCV TCP 8443' -Direction Inbound -Action Allow -Protocol TCP -LocalPort 8443 -ErrorAction SilentlyContinue | Out-Null
+            New-NetFirewallRule -DisplayName 'Amazon DCV UDP 8443' -Direction Inbound -Action Allow -Protocol UDP -LocalPort 8443 -ErrorAction SilentlyContinue | Out-Null
+
+            $downloadDriverScript = @(
+              '$ErrorActionPreference = "Stop"',
+              '[Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12',
+              'Import-Module AWSPowerShell -ErrorAction SilentlyContinue',
+              'Import-Module AWSPowerShell.NetCore -ErrorAction SilentlyContinue',
+              '$bucket = "nvidia-gaming"',
+              '$keyPrefix = "windows/latest"',
+              '$downloadRoot = Join-Path $env:USERPROFILE "Desktop\NVIDIA"',
+              'New-Item -Path $downloadRoot -ItemType Directory -Force | Out-Null',
+              '$objects = Get-S3Object -BucketName $bucket -KeyPrefix $keyPrefix -Region "us-east-1"',
+              'foreach ($object in $objects) {',
+              '  if ($object.Key -ne "" -and $object.Size -ne 0) {',
+              '    $destination = Join-Path $downloadRoot $object.Key',
+              '    $destinationDirectory = Split-Path -Path $destination -Parent',
+              '    New-Item -Path $destinationDirectory -ItemType Directory -Force | Out-Null',
+              '    Copy-S3Object -BucketName $bucket -Key $object.Key -LocalFile $destination -Region "us-east-1"',
+              '  }',
+              '}',
+              'Write-Host "Driver files downloaded to $downloadRoot"',
+              'Write-Host "Run the NVIDIA installer that matches Windows Server 2022, reboot, and then run C:\Scripts\Register-NvidiaGamingLicense.ps1"'
+            ) -join "`r`n"
+            Set-Content -Path 'C:\Scripts\Download-NvidiaGamingDriver.ps1' -Value $downloadDriverScript -Encoding ASCII
+
+            $registerLicenseScript = @(
+              '$ErrorActionPreference = "Stop"',
+              '[Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12',
+              'New-Item -Path "HKLM:\SYSTEM\CurrentControlSet\Services\nvlddmkm\Global" -Force | Out-Null',
+              'New-ItemProperty -Path "HKLM:\SYSTEM\CurrentControlSet\Services\nvlddmkm\Global" -Name "vGamingMarketplace" -PropertyType "DWord" -Value 2 -Force | Out-Null',
+              'Invoke-WebRequest -Uri "https://nvidia-gaming.s3.amazonaws.com/GridSwCert-Archive/GridSwCertWindows_2024_02_22.cert" -OutFile "$Env:PUBLIC\Documents\GridSwCert.txt"',
+              'Write-Host "NVIDIA gaming driver registration complete. Reboot the instance before testing games."'
+            ) -join "`r`n"
+            Set-Content -Path 'C:\Scripts\Register-NvidiaGamingLicense.ps1' -Value $registerLicenseScript -Encoding ASCII
+
+            $desktopReadme = @(
+              'Amazon DCV is installed.',
+              'Connect at https://<public-ip>:8443 and sign in as Administrator with the password supplied to CloudFormation.',
+              '',
+              'To prepare the AWS NVIDIA gaming driver:',
+              '1. Open an elevated PowerShell prompt.',
+              '2. Run C:\Scripts\Download-NvidiaGamingDriver.ps1',
+              '3. Launch the downloaded NVIDIA installer that matches Windows Server 2022.',
+              '4. Reboot the instance.',
+              '5. Run C:\Scripts\Register-NvidiaGamingLicense.ps1',
+              '6. Reboot the instance again.'
+            ) -join "`r`n"
+            Set-Content -Path "$Env:PUBLIC\Desktop\Gaming-Desktop-Readme.txt" -Value $desktopReadme -Encoding ASCII
+
+            & 'C:\Program Files\Amazon\cfn-bootstrap\cfn-signal.exe' -e 0 --stack ${AWS::StackName} --resource GamingInstance --region ${AWS::Region}
+          }
+          catch {
+            $_ | Out-String | Set-Content -Path "C:\cfn\log\bootstrap-error.log" -Encoding ASCII
+            & 'C:\Program Files\Amazon\cfn-bootstrap\cfn-signal.exe' -e 1 --stack ${AWS::StackName} --resource GamingInstance --region ${AWS::Region}
+            throw
+          }
+          finally {
+            Stop-Transcript -ErrorAction SilentlyContinue
+          }
+          </powershell>
+
+  GamingElasticIp:
+    Type: AWS::EC2::EIP
+    Condition: UseElasticIp
+    Properties:
+      Domain: vpc
+      Tags:
+        - Key: Name
+          Value: !Sub '${InstanceName}-eip'
+
+  GamingElasticIpAssociation:
+    Type: AWS::EC2::EIPAssociation
+    Condition: UseElasticIp
+    Properties:
+      AllocationId: !GetAtt GamingElasticIp.AllocationId
+      InstanceId: !Ref GamingInstance
+
+Outputs:
+  InstanceId:
+    Description: EC2 instance ID for the gaming desktop.
+    Value: !Ref GamingInstance
+
+  AdministratorUser:
+    Description: Windows user to log in with.
+    Value: Administrator
+
+  PublicIpAddress:
+    Description: Public IP address for the desktop.
+    Value: !If
+      - UseElasticIp
+      - !Ref GamingElasticIp
+      - !GetAtt GamingInstance.PublicIp
+
+  DcvWebUrl:
+    Description: Amazon DCV web client URL.
+    Value: !If
+      - UseElasticIp
+      - !Sub 'https://${GamingElasticIp}:8443/'
+      - !Sub 'https://${GamingInstance.PublicIp}:8443/'
+
+  DcvNativeClientUrl:
+    Description: Amazon DCV native client URL.
+    Value: !If
+      - UseElasticIp
+      - !Sub 'dcv://${GamingElasticIp}'
+      - !Sub 'dcv://${GamingInstance.PublicIp}'
+
+  BootstrapNotes:
+    Description: High-level post-deploy reminder.
+    Value: >
+      DCV is installed and the instance is ready for login. For best game compatibility,
+      log in as Administrator and run C:\Scripts\Download-NvidiaGamingDriver.ps1, install the downloaded
+      NVIDIA gaming driver, reboot, run C:\Scripts\Register-NvidiaGamingLicense.ps1, and reboot again.
