@@ -1,6 +1,6 @@
 # AWS Gaming Desktop CloudFormation
 
-This workspace contains a CloudFormation template at [cloudformation/g4dn-gaming-desktop.yaml](/Users/home/Documents/Code/DAAS/cloudformation/g4dn-gaming-desktop.yaml) that launches a single Windows gaming desktop on AWS with these defaults:
+This workspace contains a CloudFormation template that launches a single Windows gaming desktop on AWS with these defaults:
 
 - `g4dn.xlarge`
 - Windows Server 2022 from the public SSM AMI parameter
@@ -56,5 +56,5 @@ Recommended first-login flow:
 
 - This is a single-user desktop, not a multi-user streaming platform.
 - Many PC games work, but some anti-cheat systems and consumer Windows requirements can block play on Windows Server.
-- `g4dn.xlarge` includes local NVMe instance storage, but this template keeps the requested persistent storage on the 100 GiB EBS root volume.
-- Public IPv4 addresses incur AWS charges. Stopping the instance when not in use is important for cost control.
+- `g4dn.xlarge` includes local NVMe instance storage, but this template keeps the persistent storage on the 100 GiB EBS root volume.
+- Public IPv4 addresses incur AWS charges. **Stopping the instance when not in use is important for cost control.**
